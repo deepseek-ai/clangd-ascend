@@ -1,0 +1,57 @@
+From 9d20c7317c0f0924c657e0fdea5e2cf48136eab8 Mon Sep 17 00:00:00 2001
+From: kx.zhou
+Date: Mon, 25 May 2026 23:20:40 +0800
+Subject: [PATCH 2/2] clang: allow string literals to implicitly convert to
+ target address space pointers
+
+In Ascend CCE (bisheng compiler), string literals can be implicitly passed
+to functions expecting pointers in named address spaces (e.g., __gm__).
+Standard clang's address_space(N) semantics reject this because the default
+address space is not a superset of any target address space.
+
+Add a special case in IsStandardConversion: when the source expression is a
+StringLiteral undergoing array-to-pointer decay and the target type is a
+pointer whose pointee has a target-specific address space, re-qualify the
+decayed pointer with the target address space. This allows the subsequent
+qualification conversion step to succeed.
+
+This is necessary for CCE SDK headers where debug/printf functions accept
+__gm__ const char* parameters but are called with string literal arguments.
+---
+ clang/lib/Sema/SemaOverload.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
+index e11bbd708579..12247f208a2c 100644
+--- a/clang/lib/Sema/SemaOverload.cpp
++++ b/clang/lib/Sema/SemaOverload.cpp
+@@ -2456,6 +2456,26 @@ static bool IsStandardConversion(Sema &S, Expr* From, QualType ToType,
+     // T" (C++ 4.2p1).
+     FromType = S.Context.getArrayDecayedType(FromType);
+ 
++    // CCE extension: allow string literals to implicitly convert to pointers
++    // in any target address space.  The bisheng CCE compiler permits this so
++    // that string literals can be passed to functions expecting __gm__ pointers.
++    if (isa<StringLiteral>(From->IgnoreParenImpCasts())) {
++      if (const auto *ToPtrType = ToType->getAs<PointerType>()) {
++        Qualifiers ToPointeeQuals = ToPtrType->getPointeeType().getQualifiers();
++        if (ToPointeeQuals.hasAddressSpace() &&
++            isTargetAddressSpace(ToPointeeQuals.getAddressSpace())) {
++          // Re-qualify the decayed pointer's pointee with the target AS.
++          QualType FromPointee =
++              FromType->getAs<PointerType>()->getPointeeType();
++          Qualifiers FromPointeeQuals = FromPointee.getQualifiers();
++          FromPointeeQuals.setAddressSpace(ToPointeeQuals.getAddressSpace());
++          QualType NewPointee = S.Context.getQualifiedType(
++              FromPointee.getUnqualifiedType(), FromPointeeQuals);
++          FromType = S.Context.getPointerType(NewPointee);
++        }
++      }
++    }
++
+     if (S.IsStringLiteralToNonConstPointerConversion(From, ToType)) {
+       // This conversion is deprecated in C++03 (D.4)
+       SCS.DeprecatedStringLiteralToCharPtr = true;
+-- 
+2.43.0
+

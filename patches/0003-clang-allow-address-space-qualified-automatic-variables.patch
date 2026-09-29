@@ -1,0 +1,19 @@
+diff --git a/clang/lib/Sema/SemaDecl.cpp b/clang/lib/Sema/SemaDecl.cpp
+index 62cb9360d..d5c6904c7 100644
+--- a/clang/lib/Sema/SemaDecl.cpp
++++ b/clang/lib/Sema/SemaDecl.cpp
+@@ -8927,8 +8927,12 @@ void Sema::CheckVariableDeclarationType(VarDecl *NewVD) {
+   // This includes arrays of objects with address space qualifiers, but not
+   // automatic variables that point to other address spaces.
+   // ISO/IEC TR 18037 S5.1.2
+-  if (!getLangOpts().OpenCL && NewVD->hasLocalStorage() &&
+-      T.getAddressSpace() != LangAS::Default) {
++  // Ascend CCE (bisheng) allows automatic variables in named address spaces,
++  // e.g. `__ubuf__ uint8_t buf[1024]` inside an AICore kernel; the variable
++  // lives in that address space and array-to-pointer decay yields a pointer
++  // into it. Skip this check when CCE extensions are enabled.
++  if (!getLangOpts().OpenCL && !getLangOpts().CceExt &&
++      NewVD->hasLocalStorage() && T.getAddressSpace() != LangAS::Default) {
+     Diag(NewVD->getLocation(), diag::err_as_qualified_auto_decl) << 0;
+     NewVD->setInvalidDecl();
+     return;

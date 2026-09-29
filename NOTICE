@@ -1,0 +1,31 @@
+clangd-ascend Notice
+
+This repository contains project code, editor interface stubs, and
+modifications to LLVM/Clang.
+
+Original project code
+
+  Copyright (c) 2026 DeepSeek
+
+Project code, including the editor interface stubs, is provided under the MIT
+License unless covered by a more specific notice. See LICENSE.
+
+LLVM and Clang
+
+The patches in patches/ modify the LLVM Project:
+
+  https://github.com/llvm/llvm-project
+  Revision: 3056add6389b58656092edf9fed75ca6d55a9d9d
+
+The upstream LLVM code and these patches are provided under the Apache License
+2.0 with LLVM Exceptions (SPDX: Apache-2.0 WITH LLVM-exception).
+The patch license notice and full text, including the legacy LLVM license,
+are included in patches/LICENSE.
+
+Upstream copyright and license notices remain applicable. Downstream changes
+do not replace the rights or notices of the LLVM contributors.
+
+External CANN SDK
+
+SDK headers are provided by the user's local CANN installation under its
+accompanying terms and are not included in this source tree.

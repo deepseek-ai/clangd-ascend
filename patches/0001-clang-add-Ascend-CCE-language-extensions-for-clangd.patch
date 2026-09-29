@@ -1,0 +1,995 @@
+From c677586414c71f4d90b98dac800a9b616094efb3 Mon Sep 17 00:00:00 2001
+From: kx.zhou
+Date: Wed, 3 Jun 2026 14:40:36 +0800
+Subject: [PATCH 1/2] clang: add Ascend CCE language extensions for clangd
+
+Add support for Huawei Ascend CCE (Compute Core Engine) language extensions
+to enable clangd IDE support for Ascend NPU kernel development.
+
+Categories of changes:
+
+1. Parser: Skip [aicore]/[aicpu]/[aicore,host] scope annotations.
+2. Sema: Allow clang_builtin_alias for __builtin_cce_* builtins.
+3. Type system: Add 8 CCE 8-bit floating-point builtin types plus __cce_half.
+4. Kernel launch: Support the foo<<<numBlocks, smDesc, stream>>>(args) syntax.
+   - Lexer emits <<< / >>> under the new CceExt language option (default on).
+   - ActOnExecConfigExpr routes the exec config to bisheng's configure-call
+     function __cce_rtConfigureCall (the same function ccec uses; see
+     __clang_cce_runtime_wrapper.h), with signature
+     unsigned int(unsigned int numBlocks, void *smDesc, void *stream),
+     declared in the shim header. This enables argument-count and
+     argument-type checking of the launch config.
+
+The __fp8e6m2 type remains distinct from the other FP8 types. Constant
+evaluation uses an editor-only E5M2 approximation.
+---
+ clang/include/clang/AST/ASTContext.h               |    6 +
+ clang/include/clang/AST/BuiltinTypes.def           |   10 ++
+ clang/include/clang/Basic/LangOptions.def          |    4 +
+ clang/include/clang/Basic/Specifiers.h             |    8 ++
+ clang/include/clang/Basic/TargetInfo.h             |    4 +
+ clang/include/clang/Basic/TokenKinds.def           |   11 ++
+ clang/include/clang/Parse/Parser.h                 |    4 +
+ clang/include/clang/Sema/DeclSpec.h                |    8 ++
+ clang/include/clang/Serialization/ASTBitCodes.h    |   12 ++-
+ clang/lib/AST/ASTContext.cpp                       |   70 +++++++++++++++
+ clang/lib/AST/ItaniumMangle.cpp                    |    8 ++
+ clang/lib/AST/MicrosoftMangle.cpp                  |   25 +++++
+ clang/lib/AST/NSAPI.cpp                            |    8 ++
+ clang/lib/AST/Type.cpp                             |   16 +++
+ clang/lib/AST/TypeLoc.cpp                          |    8 ++
+ clang/lib/Basic/TargetInfo.cpp                     |    1
+ clang/lib/Basic/Targets/AArch64.cpp                |    3 +
+ clang/lib/Lex/Lexer.cpp                            |    4 -
+ clang/lib/Parse/ParseDecl.cpp                      |   93 ++++++++++++++++++++
+ clang/lib/Sema/DeclSpec.cpp                        |   16 +++
+ clang/lib/Sema/SemaCUDA.cpp                        |   17 ++++
+ clang/lib/Sema/SemaDecl.cpp                        |   17 ++++
+ clang/lib/Sema/SemaDeclAttr.cpp                    |    9 ++
+ clang/lib/Sema/SemaTemplateVariadic.cpp            |    8 ++
+ clang/lib/Sema/SemaType.cpp                        |    8 ++
+ clang/lib/Serialization/ASTCommon.cpp              |   26 +++++-
+ clang/lib/Serialization/ASTReader.cpp              |   24 +++++
+ .../lib/UnifiedSymbolResolution/USRGeneration.cpp  |   10 ++
+ clang/lib/Parse/ParseExpr.cpp                      |    8 ++
+ clang/lib/Parse/ParseExprCXX.cpp                   |   24 +++++
+ clang/lib/Parse/ParseTentative.cpp                 |   16 +++
+ 31 files changed, 480 insertions(+), 6 deletions(-)
+
+diff --git a/clang/include/clang/AST/ASTContext.h b/clang/include/clang/AST/ASTContext.h
+index 9ef27cc1e..95eedfa76 100644
+--- a/clang/include/clang/AST/ASTContext.h
++++ b/clang/include/clang/AST/ASTContext.h
+@@ -1338,8 +1338,10 @@ public:
+   CanQualType SatUnsignedShortFractTy, SatUnsignedFractTy,
+       SatUnsignedLongFractTy;
+   CanQualType HalfTy; // [OpenCL 6.1.1.1], ARM NEON
+-  CanQualType BFloat16Ty;
+-  CanQualType Float16Ty; // C11 extension ISO/IEC TS 18661-3
++CanQualType BFloat16Ty;
++CanQualType CceHif8Ty, CceHif4x2Ty, CceFp8E4M3Ty, CceFp8E5M2Ty, CceFp8E6M2Ty;
++CanQualType CceFp8E8M0Ty, CceFp4E2M1x2Ty, CceFp4E1M2x2Ty;
++CanQualType Float16Ty; // C11 extension ISO/IEC TS 18661-3
+   CanQualType VoidPtrTy, NullPtrTy;
+   CanQualType DependentTy, OverloadTy, BoundMemberTy, UnresolvedTemplateTy,
+       UnknownAnyTy;
+diff --git a/clang/include/clang/AST/BuiltinTypes.def b/clang/include/clang/AST/BuiltinTypes.def
+index 444be4311..c7052f610 100644
+--- a/clang/include/clang/AST/BuiltinTypes.def
++++ b/clang/include/clang/AST/BuiltinTypes.def
+@@ -215,6 +215,16 @@ FLOATING_TYPE(Float16, HalfTy)
+ // '__bf16'
+ FLOATING_TYPE(BFloat16, BFloat16Ty)
+ 
++// Ascend CCE 8-bit floating-point types
++FLOATING_TYPE(CceHif8, CceHif8Ty)
++FLOATING_TYPE(CceHif4x2, CceHif4x2Ty)
++FLOATING_TYPE(CceFp8E4M3, CceFp8E4M3Ty)
++FLOATING_TYPE(CceFp8E5M2, CceFp8E5M2Ty)
++FLOATING_TYPE(CceFp8E6M2, CceFp8E6M2Ty)
++FLOATING_TYPE(CceFp8E8M0, CceFp8E8M0Ty)
++FLOATING_TYPE(CceFp4E2M1x2, CceFp4E2M1x2Ty)
++FLOATING_TYPE(CceFp4E1M2x2, CceFp4E1M2x2Ty)
++
+ // '__float128'
+ FLOATING_TYPE(Float128, Float128Ty)
+ 
+diff --git a/clang/include/clang/Basic/LangOptions.def b/clang/include/clang/Basic/LangOptions.def
+index 3bbb40ba0..b16f0f9b0 100644
+--- a/clang/include/clang/Basic/LangOptions.def
++++ b/clang/include/clang/Basic/LangOptions.def
+@@ -273,6 +273,10 @@ LANGOPT(HIPStdParInterposeAlloc, 1, 0, NotCompatible, "Replace allocations / dea
+ 
+ LANGOPT(OpenACC           , 1, 0, NotCompatible, "OpenACC Enabled")
+ 
++// Ascend CCE extensions: enable <<<...>>> kernel-launch syntax (default on for
++// this CCE clangd build). Args: (unsigned int numBlocks, void *smDesc, void *stream).
++LANGOPT(CceExt            , 1, 1, NotCompatible, "Ascend CCE extensions enabled")
++
+ LANGOPT(MSVCEnableStdcMacro , 1, 0, NotCompatible, "Define __STDC__ with '-fms-compatibility'")
+ LANGOPT(SizedDeallocation , 1, 0, NotCompatible, "sized deallocation")
+ LANGOPT(AlignedAllocation , 1, 0, NotCompatible, "aligned allocation")
+diff --git a/clang/include/clang/Basic/Specifiers.h b/clang/include/clang/Basic/Specifiers.h
+index 8da6fd4cf..a8980740d 100644
+--- a/clang/include/clang/Basic/Specifiers.h
++++ b/clang/include/clang/Basic/Specifiers.h
+@@ -69,6 +69,14 @@ namespace clang {
+     TST_Accum,   // ISO/IEC JTC1 SC22 WG14 N1169 Extension
+     TST_Fract,
+     TST_BFloat16,
++    TST_CceHif8,       // Ascend CCE __hif8
++    TST_CceHif4x2,     // Ascend CCE __hif4x2
++    TST_CceFp8E4M3,    // Ascend CCE __fp8e4m3
++    TST_CceFp8E5M2,    // Ascend CCE __fp8e5m2
++    TST_CceFp8E6M2,    // Ascend CCE __fp8e6m2
++    TST_CceFp8E8M0,    // Ascend CCE __fp8e8m0
++    TST_CceFp4E2M1x2,  // Ascend CCE __fp4e2m1x2
++    TST_CceFp4E1M2x2,  // Ascend CCE __fp4e1m2x2
+     TST_float,
+     TST_double,
+     TST_float128,
+diff --git a/clang/include/clang/Basic/TargetInfo.h b/clang/include/clang/Basic/TargetInfo.h
+index cc2264038..dd50e6747 100644
+--- a/clang/include/clang/Basic/TargetInfo.h
++++ b/clang/include/clang/Basic/TargetInfo.h
+@@ -245,6 +245,7 @@ protected:
+   bool HasFullBFloat16; // True if the backend supports native bfloat16
+                         // arithmetic. Used to determine excess precision
+                         // support in the frontend.
++  bool HasCceFloat8Types; // Ascend CCE 8-bit float types
+   bool HasIbm128;
+   bool HasLongDouble;
+   bool HasFPReturn;
+@@ -729,6 +730,9 @@ public:
+   /// arithemtic operations.
+   virtual bool hasFullBFloat16Type() const { return HasFullBFloat16; }
+ 
++  /// Determine whether the Ascend CCE 8-bit float types are supported.
++  virtual bool hasCceFloat8Types() const { return HasCceFloat8Types; }
++
+   /// Determine whether the __ibm128 type is supported on this target.
+   virtual bool hasIbm128Type() const { return HasIbm128; }
+ 
+diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
+index f07d8ebb7..6faa2963d 100644
+--- a/clang/include/clang/Basic/TokenKinds.def
++++ b/clang/include/clang/Basic/TokenKinds.def
+@@ -708,6 +708,17 @@ KEYWORD(__bool                      , KEYALTIVEC|KEYZVECTOR)
+ ALIAS("__fp16", half                , KEYALL)
+ KEYWORD(__bf16                      , KEYALL)
+ 
++// Ascend CCE extensions.
++ALIAS("__cce_half", half            , KEYALL)
++KEYWORD(__hif8                      , KEYALL)
++KEYWORD(__hif4x2                    , KEYALL)
++KEYWORD(__fp8e4m3                   , KEYALL)
++KEYWORD(__fp8e5m2                   , KEYALL)
++KEYWORD(__fp8e6m2                   , KEYALL)
++KEYWORD(__fp8e8m0                   , KEYALL)
++KEYWORD(__fp4e2m1x2                 , KEYALL)
++KEYWORD(__fp4e1m2x2                 , KEYALL)
++
+ // OpenCL Extension.
+ KEYWORD(half                        , HALFSUPPORT)
+ 
+diff --git a/clang/include/clang/Parse/Parser.h b/clang/include/clang/Parse/Parser.h
+index c6c492b49..fc75f98bc 100644
+--- a/clang/include/clang/Parse/Parser.h
++++ b/clang/include/clang/Parse/Parser.h
+@@ -3033,6 +3033,10 @@ private:
+   /// locations where attributes are not allowed.
+   void DiagnoseAndSkipCXX11Attributes();
+ 
++  /// Try to skip Ascend CCE scope annotations like [aicore], [aicore, host],
++  /// [aicpu]. Returns true if a CCE annotation was consumed, false otherwise.
++  bool TrySkipCCEScopeAnnotation();
++
+   void ParseOpenMPAttributeArgs(const IdentifierInfo *AttrName,
+                                 CachedTokens &OpenMPTokens);
+ 
+diff --git a/clang/include/clang/Sema/DeclSpec.h b/clang/include/clang/Sema/DeclSpec.h
+index b3c459821..cf67d7ead 100644
+--- a/clang/include/clang/Sema/DeclSpec.h
++++ b/clang/include/clang/Sema/DeclSpec.h
+@@ -260,6 +260,14 @@ public:
+   static const TST TST_bitint = clang::TST_bitint;
+   static const TST TST_half = clang::TST_half;
+   static const TST TST_BFloat16 = clang::TST_BFloat16;
++  static const TST TST_CceHif8 = clang::TST_CceHif8;
++  static const TST TST_CceHif4x2 = clang::TST_CceHif4x2;
++  static const TST TST_CceFp8E4M3 = clang::TST_CceFp8E4M3;
++  static const TST TST_CceFp8E5M2 = clang::TST_CceFp8E5M2;
++  static const TST TST_CceFp8E6M2 = clang::TST_CceFp8E6M2;
++  static const TST TST_CceFp8E8M0 = clang::TST_CceFp8E8M0;
++  static const TST TST_CceFp4E2M1x2 = clang::TST_CceFp4E2M1x2;
++  static const TST TST_CceFp4E1M2x2 = clang::TST_CceFp4E1M2x2;
+   static const TST TST_float = clang::TST_float;
+   static const TST TST_double = clang::TST_double;
+   static const TST TST_float16 = clang::TST_Float16;
+diff --git a/clang/include/clang/Serialization/ASTBitCodes.h b/clang/include/clang/Serialization/ASTBitCodes.h
+index 3c8f3ba59..d33aecfba 100644
+--- a/clang/include/clang/Serialization/ASTBitCodes.h
++++ b/clang/include/clang/Serialization/ASTBitCodes.h
+@@ -1137,6 +1137,16 @@ enum PredefinedTypeIDs {
+   /// \brief The '__ibm128' type
+   PREDEF_TYPE_IBM128_ID = 74,
+ 
++  /// Ascend CCE 8-bit float types
++  PREDEF_TYPE_CCE_HIF8_ID = 75,
++  PREDEF_TYPE_CCE_HIF4X2_ID = 76,
++  PREDEF_TYPE_CCE_FP8E4M3_ID = 77,
++  PREDEF_TYPE_CCE_FP8E5M2_ID = 78,
++  PREDEF_TYPE_CCE_FP8E8M0_ID = 79,
++  PREDEF_TYPE_CCE_FP4E2M1X2_ID = 80,
++  PREDEF_TYPE_CCE_FP4E1M2X2_ID = 81,
++  PREDEF_TYPE_CCE_FP8E6M2_ID = 82,
++
+ /// OpenCL image types with auto numeration
+ #define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix)                   \
+   PREDEF_TYPE_##Id##_ID,
+@@ -1174,7 +1184,7 @@ enum PredefinedTypeIDs {
+ ///
+ /// Type IDs for non-predefined types will start at
+ /// NUM_PREDEF_TYPE_IDs.
+-const unsigned NUM_PREDEF_TYPE_IDS = 529;
++const unsigned NUM_PREDEF_TYPE_IDS = 537;
+ 
+ // Ensure we do not overrun the predefined types we reserved
+ // in the enum PredefinedTypeIDs above.
+diff --git a/clang/lib/AST/ASTContext.cpp b/clang/lib/AST/ASTContext.cpp
+index a401a7471..968c087e5 100644
+--- a/clang/lib/AST/ASTContext.cpp
++++ b/clang/lib/AST/ASTContext.cpp
+@@ -106,6 +106,14 @@
+ using namespace clang;
+ 
+ enum FloatingRank {
++  CceHif8Rank,
++  CceHif4x2Rank,
++  CceFp8E4M3Rank,
++  CceFp8E5M2Rank,
++  CceFp8E6M2Rank,
++  CceFp8E8M0Rank,
++  CceFp4E2M1x2Rank,
++  CceFp4E1M2x2Rank,
+   BFloat16Rank,
+   Float16Rank,
+   HalfRank,
+@@ -1513,6 +1521,16 @@ void ASTContext::InitBuiltinTypes(const TargetInfo &Target,
+ 
+   InitBuiltinType(BFloat16Ty, BuiltinType::BFloat16);
+ 
++  // Ascend CCE 8-bit float types
++  InitBuiltinType(CceHif8Ty, BuiltinType::CceHif8);
++  InitBuiltinType(CceHif4x2Ty, BuiltinType::CceHif4x2);
++  InitBuiltinType(CceFp8E4M3Ty, BuiltinType::CceFp8E4M3);
++  InitBuiltinType(CceFp8E5M2Ty, BuiltinType::CceFp8E5M2);
++  InitBuiltinType(CceFp8E6M2Ty, BuiltinType::CceFp8E6M2);
++  InitBuiltinType(CceFp8E8M0Ty, BuiltinType::CceFp8E8M0);
++  InitBuiltinType(CceFp4E2M1x2Ty, BuiltinType::CceFp4E2M1x2);
++  InitBuiltinType(CceFp4E1M2x2Ty, BuiltinType::CceFp4E1M2x2);
++
+   // Builtin type used to help define __builtin_va_list.
+   VaListTagDecl = nullptr;
+ 
+@@ -1825,6 +1843,23 @@ const llvm::fltSemantics &ASTContext::getFloatTypeSemantics(QualType T) const {
+     llvm_unreachable("Not a floating point type!");
+   case BuiltinType::BFloat16:
+     return Target->getBFloat16Format();
++  case BuiltinType::CceHif8:
++    return llvm::APFloat::Float8E4M3FN();
++  case BuiltinType::CceHif4x2:
++    return llvm::APFloat::Float8E5M2FNUZ();
++  case BuiltinType::CceFp8E4M3:
++    return llvm::APFloat::Float8E4M3();
++  case BuiltinType::CceFp8E5M2:
++    return llvm::APFloat::Float8E5M2();
++  case BuiltinType::CceFp8E6M2:
++    // Editor-only approximation; retain a distinct 8-bit builtin type.
++    return llvm::APFloat::Float8E5M2();
++  case BuiltinType::CceFp8E8M0:
++    return llvm::APFloat::Float8E8M0FNU();
++  case BuiltinType::CceFp4E2M1x2:
++    return llvm::APFloat::Float8E4M3FNUZ();
++  case BuiltinType::CceFp4E1M2x2:
++    return llvm::APFloat::Float8E3M4();
+   case BuiltinType::Float16:
+     return Target->getHalfFormat();
+   case BuiltinType::Half:
+@@ -2299,6 +2334,17 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
+         Align = AuxTarget->getBFloat16Align();
+       }
+       break;
++    case BuiltinType::CceHif8:
++    case BuiltinType::CceHif4x2:
++    case BuiltinType::CceFp8E4M3:
++    case BuiltinType::CceFp8E5M2:
++    case BuiltinType::CceFp8E6M2:
++    case BuiltinType::CceFp8E8M0:
++    case BuiltinType::CceFp4E2M1x2:
++    case BuiltinType::CceFp4E1M2x2:
++      Width = 8;
++      Align = 8;
++      break;
+     case BuiltinType::Float16:
+     case BuiltinType::Half:
+       if (Target->hasFloat16Type() || !getLangOpts().OpenMP ||
+@@ -3550,6 +3596,14 @@ static void encodeTypeForFunctionPointerAuth(const ASTContext &Ctx,
+     case BuiltinType::OCLQueue:
+     case BuiltinType::OCLReserveID:
+     case BuiltinType::BFloat16:
++    case BuiltinType::CceHif8:
++    case BuiltinType::CceHif4x2:
++    case BuiltinType::CceFp8E4M3:
++    case BuiltinType::CceFp8E5M2:
++    case BuiltinType::CceFp8E6M2:
++    case BuiltinType::CceFp8E8M0:
++    case BuiltinType::CceFp4E2M1x2:
++    case BuiltinType::CceFp4E1M2x2:
+     case BuiltinType::VectorQuad:
+     case BuiltinType::VectorPair:
+     case BuiltinType::DMR1024:
+@@ -8231,6 +8285,14 @@ static FloatingRank getFloatingRank(QualType T) {
+   case BuiltinType::LongDouble: return LongDoubleRank;
+   case BuiltinType::Float128:   return Float128Rank;
+   case BuiltinType::BFloat16:   return BFloat16Rank;
++  case BuiltinType::CceHif8:      return CceHif8Rank;
++  case BuiltinType::CceHif4x2:    return CceHif4x2Rank;
++  case BuiltinType::CceFp8E4M3:   return CceFp8E4M3Rank;
++  case BuiltinType::CceFp8E5M2:   return CceFp8E5M2Rank;
++  case BuiltinType::CceFp8E6M2:   return CceFp8E6M2Rank;
++  case BuiltinType::CceFp8E8M0:   return CceFp8E8M0Rank;
++  case BuiltinType::CceFp4E2M1x2: return CceFp4E2M1x2Rank;
++  case BuiltinType::CceFp4E1M2x2: return CceFp4E1M2x2Rank;
+   case BuiltinType::Ibm128:     return Ibm128Rank;
+   }
+ }
+@@ -9244,6 +9306,14 @@ static char getObjCEncodingForPrimitiveType(const ASTContext *C,
+     case BuiltinType::NullPtr:    return '*'; // like char*
+ 
+     case BuiltinType::BFloat16:
++    case BuiltinType::CceHif8:
++    case BuiltinType::CceHif4x2:
++    case BuiltinType::CceFp8E4M3:
++    case BuiltinType::CceFp8E5M2:
++    case BuiltinType::CceFp8E6M2:
++    case BuiltinType::CceFp8E8M0:
++    case BuiltinType::CceFp4E2M1x2:
++    case BuiltinType::CceFp4E1M2x2:
+     case BuiltinType::Float16:
+     case BuiltinType::Float128:
+     case BuiltinType::Ibm128:
+diff --git a/clang/lib/AST/ItaniumMangle.cpp b/clang/lib/AST/ItaniumMangle.cpp
+index 1cb6fa05f..1a3c4506d 100644
+--- a/clang/lib/AST/ItaniumMangle.cpp
++++ b/clang/lib/AST/ItaniumMangle.cpp
+@@ -3404,6 +3404,14 @@ void CXXNameMangler::mangleType(const BuiltinType *T) {
+     Out << TI->getBFloat16Mangling();
+     break;
+   }
++  case BuiltinType::CceHif8:      Out << "u6__hif8"; break;
++  case BuiltinType::CceHif4x2:    Out << "u8__hif4x2"; break;
++  case BuiltinType::CceFp8E4M3:   Out << "u9__fp8e4m3"; break;
++  case BuiltinType::CceFp8E5M2:   Out << "u9__fp8e5m2"; break;
++  case BuiltinType::CceFp8E6M2:   Out << "u9__fp8e6m2"; break;
++  case BuiltinType::CceFp8E8M0:   Out << "u9__fp8e8m0"; break;
++  case BuiltinType::CceFp4E2M1x2: Out << "u11__fp4e2m1x2"; break;
++  case BuiltinType::CceFp4E1M2x2: Out << "u11__fp4e1m2x2"; break;
+   case BuiltinType::Ibm128: {
+     const TargetInfo *TI = &getASTContext().getTargetInfo();
+     Out << TI->getIbm128Mangling();
+diff --git a/clang/lib/AST/MicrosoftMangle.cpp b/clang/lib/AST/MicrosoftMangle.cpp
+index 7d0c60d57..d9c6fd708 100644
+--- a/clang/lib/AST/MicrosoftMangle.cpp
++++ b/clang/lib/AST/MicrosoftMangle.cpp
+@@ -2813,6 +2813,31 @@ void MicrosoftCXXNameMangler::mangleType(const BuiltinType *T, Qualifiers,
+     mangleArtificialTagType(TagTypeKind::Struct, "__bf16", {"__clang"});
+     break;
+ 
++  case BuiltinType::CceHif8:
++    mangleArtificialTagType(TagTypeKind::Struct, "__hif8", {"__cce"});
++    break;
++  case BuiltinType::CceHif4x2:
++    mangleArtificialTagType(TagTypeKind::Struct, "__hif4x2", {"__cce"});
++    break;
++  case BuiltinType::CceFp8E4M3:
++    mangleArtificialTagType(TagTypeKind::Struct, "__fp8e4m3", {"__cce"});
++    break;
++  case BuiltinType::CceFp8E5M2:
++    mangleArtificialTagType(TagTypeKind::Struct, "__fp8e5m2", {"__cce"});
++    break;
++  case BuiltinType::CceFp8E6M2:
++    mangleArtificialTagType(TagTypeKind::Struct, "__fp8e6m2", {"__cce"});
++    break;
++  case BuiltinType::CceFp8E8M0:
++    mangleArtificialTagType(TagTypeKind::Struct, "__fp8e8m0", {"__cce"});
++    break;
++  case BuiltinType::CceFp4E2M1x2:
++    mangleArtificialTagType(TagTypeKind::Struct, "__fp4e2m1x2", {"__cce"});
++    break;
++  case BuiltinType::CceFp4E1M2x2:
++    mangleArtificialTagType(TagTypeKind::Struct, "__fp4e1m2x2", {"__cce"});
++    break;
++
+   case BuiltinType::MFloat8:
+     mangleArtificialTagType(TagTypeKind::Struct, "__mfp8", {"__clang"});
+     break;
+diff --git a/clang/lib/AST/NSAPI.cpp b/clang/lib/AST/NSAPI.cpp
+index 17f5ee5de..c8ffe5aad 100644
+--- a/clang/lib/AST/NSAPI.cpp
++++ b/clang/lib/AST/NSAPI.cpp
+@@ -471,6 +471,14 @@ NSAPI::getNSNumberFactoryMethodKind(QualType T) const {
+   case BuiltinType::OMPArrayShaping:
+   case BuiltinType::OMPIterator:
+   case BuiltinType::BFloat16:
++  case BuiltinType::CceHif8:
++  case BuiltinType::CceHif4x2:
++  case BuiltinType::CceFp8E4M3:
++  case BuiltinType::CceFp8E5M2:
++  case BuiltinType::CceFp8E6M2:
++  case BuiltinType::CceFp8E8M0:
++  case BuiltinType::CceFp4E2M1x2:
++  case BuiltinType::CceFp4E1M2x2:
+     break;
+   }
+ 
+diff --git a/clang/lib/AST/Type.cpp b/clang/lib/AST/Type.cpp
+index 96a398aa2..50653a279 100644
+--- a/clang/lib/AST/Type.cpp
++++ b/clang/lib/AST/Type.cpp
+@@ -3520,6 +3520,22 @@ StringRef BuiltinType::getName(const PrintingPolicy &Policy) const {
+     return Policy.Half ? "half" : "__fp16";
+   case BFloat16:
+     return "__bf16";
++  case CceHif8:
++    return "__hif8";
++  case CceHif4x2:
++    return "__hif4x2";
++  case CceFp8E4M3:
++    return "__fp8e4m3";
++  case CceFp8E5M2:
++    return "__fp8e5m2";
++  case CceFp8E6M2:
++    return "__fp8e6m2";
++  case CceFp8E8M0:
++    return "__fp8e8m0";
++  case CceFp4E2M1x2:
++    return "__fp4e2m1x2";
++  case CceFp4E1M2x2:
++    return "__fp4e1m2x2";
+   case Float:
+     return "float";
+   case Double:
+diff --git a/clang/lib/AST/TypeLoc.cpp b/clang/lib/AST/TypeLoc.cpp
+index 7e72a8513..cb1d39825 100644
+--- a/clang/lib/AST/TypeLoc.cpp
++++ b/clang/lib/AST/TypeLoc.cpp
+@@ -382,6 +382,14 @@ TypeSpecifierType BuiltinTypeLoc::getWrittenTypeSpec() const {
+   case BuiltinType::SatUFract:
+   case BuiltinType::SatULongFract:
+   case BuiltinType::BFloat16:
++  case BuiltinType::CceHif8:
++  case BuiltinType::CceHif4x2:
++  case BuiltinType::CceFp8E4M3:
++  case BuiltinType::CceFp8E5M2:
++  case BuiltinType::CceFp8E6M2:
++  case BuiltinType::CceFp8E8M0:
++  case BuiltinType::CceFp4E2M1x2:
++  case BuiltinType::CceFp4E1M2x2:
+     llvm_unreachable("Builtin type needs extra local data!");
+     // Fall through, if the impossible happens.
+ 
+diff --git a/clang/lib/Basic/TargetInfo.cpp b/clang/lib/Basic/TargetInfo.cpp
+index ad083242d..efd166d98 100644
+--- a/clang/lib/Basic/TargetInfo.cpp
++++ b/clang/lib/Basic/TargetInfo.cpp
+@@ -73,6 +73,7 @@ TargetInfo::TargetInfo(const llvm::Triple &T) : Triple(T) {
+   HasFloat16 = false;
+   HasBFloat16 = false;
+   HasFullBFloat16 = false;
++  HasCceFloat8Types = false;
+   HasLongDouble = true;
+   HasFPReturn = true;
+   HasStrictFP = false;
+diff --git a/clang/lib/Basic/Targets/AArch64.cpp b/clang/lib/Basic/Targets/AArch64.cpp
+index 9afe6cb10..f4228226b 100644
+--- a/clang/lib/Basic/Targets/AArch64.cpp
++++ b/clang/lib/Basic/Targets/AArch64.cpp
+@@ -168,6 +168,9 @@ AArch64TargetInfo::AArch64TargetInfo(const llvm::Triple &Triple,
+   BFloat16Width = BFloat16Align = 16;
+   BFloat16Format = &llvm::APFloat::BFloat();
+ 
++  // Enable Ascend CCE 8-bit float types on AArch64.
++  HasCceFloat8Types = true;
++
+   // Make __builtin_ms_va_list available.
+   HasBuiltinMSVaList = true;
+ 
+diff --git a/clang/lib/Lex/Lexer.cpp b/clang/lib/Lex/Lexer.cpp
+index 2797212c2..c38e3d1c4 100644
+--- a/clang/lib/Lex/Lexer.cpp
++++ b/clang/lib/Lex/Lexer.cpp
+@@ -4311,7 +4311,7 @@ LexStart:
+         // If this is '<<<<' and we're in a Perforce-style conflict marker,
+         // ignore it.
+         goto LexNextToken;
+-      } else if (LangOpts.CUDA && After == '<') {
++      } else if ((LangOpts.CUDA || LangOpts.CceExt) && After == '<') {
+         Kind = tok::lesslessless;
+         CurPtr = ConsumeChar(ConsumeChar(CurPtr, SizeTmp, Result),
+                              SizeTmp2, Result);
+@@ -4388,7 +4388,7 @@ LexStart:
+       } else if (After == '>' && HandleEndOfConflictMarker(CurPtr-1)) {
+         // If this is '>>>>>>>' and we're in a conflict marker, ignore it.
+         goto LexNextToken;
+-      } else if (LangOpts.CUDA && After == '>') {
++      } else if ((LangOpts.CUDA || LangOpts.CceExt) && After == '>') {
+         Kind = tok::greatergreatergreater;
+         CurPtr = ConsumeChar(ConsumeChar(CurPtr, SizeTmp, Result),
+                              SizeTmp2, Result);
+diff --git a/clang/lib/Parse/ParseDecl.cpp b/clang/lib/Parse/ParseDecl.cpp
+index 405dddf79..9328f9cde 100644
+--- a/clang/lib/Parse/ParseDecl.cpp
++++ b/clang/lib/Parse/ParseDecl.cpp
+@@ -1084,6 +1084,47 @@ void Parser::ParseCUDAFunctionAttributes(ParsedAttributes &attrs) {
+   }
+ }
+ 
++/// TrySkipCCEScopeAnnotation - Check if the current token starts an Ascend CCE
++/// scope annotation like [aicore], [aicore, host], or [aicpu]. If so, consume
++/// all tokens up to and including the closing ']' and return true. Otherwise,
++/// return false without consuming any tokens.
++bool Parser::TrySkipCCEScopeAnnotation() {
++  // Must start with '['
++  if (Tok.isNot(tok::l_square))
++    return false;
++
++  // Peek: the token after '[' must be an identifier that is a known CCE scope.
++  const Token &Next = NextToken();
++  if (Next.isNot(tok::identifier))
++    return false;
++
++  IdentifierInfo *II = Next.getIdentifierInfo();
++  if (!II)
++    return false;
++
++  StringRef Name = II->getName();
++  if (Name != "aicore" && Name != "aicpu" && Name != "host")
++    return false;
++
++  // This looks like a CCE scope annotation. Consume '[', identifier, and
++  // optionally ', identifier' repeated, then ']'.
++  ConsumeBracket(); // '['
++  ConsumeToken();   // first identifier (aicore/aicpu/host)
++
++  // Consume optional comma-separated identifiers: [aicore, host]
++  while (Tok.is(tok::comma)) {
++    ConsumeToken(); // ','
++    if (Tok.is(tok::identifier))
++      ConsumeToken(); // next scope identifier
++  }
++
++  // Expect and consume ']'
++  if (Tok.is(tok::r_square))
++    ConsumeBracket();
++
++  return true;
++}
++
+ void Parser::ParseOpenCLQualifiers(ParsedAttributes &Attrs) {
+   IdentifierInfo *AttrName = Tok.getIdentifierInfo();
+   SourceLocation AttrNameLoc = Tok.getLocation();
+@@ -3509,6 +3550,10 @@ void Parser::ParseDeclarationSpecifiers(
+       }
+       [[fallthrough]];
+     case tok::l_square:
++      // Try to skip Ascend CCE scope annotations like [aicore], [aicpu],
++      // [aicore, host] before checking for C++11 attributes.
++      if (TrySkipCCEScopeAnnotation())
++        continue;
+       if (!isAllowedCXX11AttributeSpecifier())
+         goto DoneWithDeclSpec;
+ 
+@@ -4367,6 +4412,30 @@ void Parser::ParseDeclarationSpecifiers(
+       isInvalid = DS.SetTypeSpecType(DeclSpec::TST_BFloat16, Loc, PrevSpec,
+                                      DiagID, Policy);
+       break;
++    case tok::kw___hif8:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceHif8, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___hif4x2:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceHif4x2, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___fp8e4m3:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceFp8E4M3, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___fp8e5m2:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceFp8E5M2, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___fp8e6m2:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceFp8E6M2, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___fp8e8m0:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceFp8E8M0, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___fp4e2m1x2:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceFp4E2M1x2, Loc, PrevSpec, DiagID, Policy);
++      break;
++    case tok::kw___fp4e1m2x2:
++      isInvalid = DS.SetTypeSpecType(DeclSpec::TST_CceFp4E1M2x2, Loc, PrevSpec, DiagID, Policy);
++      break;
+     case tok::kw_float:
+       isInvalid = DS.SetTypeSpecType(DeclSpec::TST_float, Loc, PrevSpec,
+                                      DiagID, Policy);
+@@ -5623,6 +5692,14 @@ bool Parser::isKnownToBeTypeSpecifier(const Token &Tok) const {
+   case tok::kw__ExtInt:
+   case tok::kw__BitInt:
+   case tok::kw___bf16:
++  case tok::kw___hif8:
++  case tok::kw___hif4x2:
++  case tok::kw___fp8e4m3:
++  case tok::kw___fp8e5m2:
++  case tok::kw___fp8e6m2:
++  case tok::kw___fp8e8m0:
++  case tok::kw___fp4e2m1x2:
++  case tok::kw___fp4e1m2x2:
+   case tok::kw_half:
+   case tok::kw_float:
+   case tok::kw_double:
+@@ -5714,6 +5791,14 @@ bool Parser::isTypeSpecifierQualifier(const Token &Tok) {
+   case tok::kw__BitInt:
+   case tok::kw_half:
+   case tok::kw___bf16:
++  case tok::kw___hif8:
++  case tok::kw___hif4x2:
++  case tok::kw___fp8e4m3:
++  case tok::kw___fp8e5m2:
++  case tok::kw___fp8e6m2:
++  case tok::kw___fp8e8m0:
++  case tok::kw___fp4e2m1x2:
++  case tok::kw___fp4e1m2x2:
+   case tok::kw_float:
+   case tok::kw_double:
+   case tok::kw__Accum:
+@@ -5935,6 +6020,14 @@ bool Parser::isDeclarationSpecifier(
+   case tok::kw__BitInt:
+   case tok::kw_half:
+   case tok::kw___bf16:
++  case tok::kw___hif8:
++  case tok::kw___hif4x2:
++  case tok::kw___fp8e4m3:
++  case tok::kw___fp8e5m2:
++  case tok::kw___fp8e6m2:
++  case tok::kw___fp8e8m0:
++  case tok::kw___fp4e2m1x2:
++  case tok::kw___fp4e1m2x2:
+   case tok::kw_float:
+   case tok::kw_double:
+   case tok::kw__Accum:
+diff --git a/clang/lib/Sema/DeclSpec.cpp b/clang/lib/Sema/DeclSpec.cpp
+index 660b1805c..08a5cbdee 100644
+--- a/clang/lib/Sema/DeclSpec.cpp
++++ b/clang/lib/Sema/DeclSpec.cpp
+@@ -345,6 +345,14 @@ bool Declarator::isDeclarationOfFunction() const {
+     case TST_void:
+     case TST_wchar:
+     case TST_BFloat16:
++    case TST_CceHif8:
++    case TST_CceHif4x2:
++    case TST_CceFp8E4M3:
++    case TST_CceFp8E5M2:
++    case TST_CceFp8E6M2:
++    case TST_CceFp8E8M0:
++    case TST_CceFp4E2M1x2:
++    case TST_CceFp4E1M2x2:
+     case TST_typename_pack_indexing:
+ #define GENERIC_IMAGE_TYPE(ImgType, Id) case TST_##ImgType##_t:
+ #include "clang/Basic/OpenCLImageTypes.def"
+@@ -577,6 +585,14 @@ const char *DeclSpec::getSpecifierName(DeclSpec::TST T,
+   case DeclSpec::TST_unknown_anytype: return "__unknown_anytype";
+   case DeclSpec::TST_atomic: return "_Atomic";
+   case DeclSpec::TST_BFloat16: return "__bf16";
++  case DeclSpec::TST_CceHif8: return "__hif8";
++  case DeclSpec::TST_CceHif4x2: return "__hif4x2";
++  case DeclSpec::TST_CceFp8E4M3: return "__fp8e4m3";
++  case DeclSpec::TST_CceFp8E5M2: return "__fp8e5m2";
++  case DeclSpec::TST_CceFp8E6M2: return "__fp8e6m2";
++  case DeclSpec::TST_CceFp8E8M0: return "__fp8e8m0";
++  case DeclSpec::TST_CceFp4E2M1x2: return "__fp4e2m1x2";
++  case DeclSpec::TST_CceFp4E1M2x2: return "__fp4e1m2x2";
+ #define GENERIC_IMAGE_TYPE(ImgType, Id) \
+   case DeclSpec::TST_##ImgType##_t: \
+     return #ImgType "_t";
+diff --git a/clang/lib/Sema/SemaCUDA.cpp b/clang/lib/Sema/SemaCUDA.cpp
+index 9e05de941..f45f6274f 100644
+--- a/clang/lib/Sema/SemaCUDA.cpp
++++ b/clang/lib/Sema/SemaCUDA.cpp
+@@ -52,6 +52,23 @@ bool SemaCUDA::PopForceHostDevice() {
+ ExprResult SemaCUDA::ActOnExecConfigExpr(Scope *S, SourceLocation LLLLoc,
+                                          MultiExprArg ExecConfig,
+                                          SourceLocation GGGLoc) {
++  // Ascend CCE kernel-launch: foo<<<numBlocks, smDesc, stream>>>(args).
++  // When not compiling CUDA, route the exec config to bisheng's configure-call
++  // function __cce_rtConfigureCall (signature: unsigned int(unsigned int
++  // numBlocks, void *smDesc, void *stream)), declared in the CCE shim header.
++  if (!getLangOpts().CUDA && getLangOpts().CceExt) {
++    FunctionDecl *ConfigDecl = getASTContext().getcudaConfigureCallDecl();
++    if (!ConfigDecl)
++      return ExprError(Diag(LLLLoc, diag::err_undeclared_var_use)
++                       << "__cce_rtConfigureCall");
++    QualType ConfigQTy = ConfigDecl->getType();
++    DeclRefExpr *ConfigDR = new (getASTContext()) DeclRefExpr(
++        getASTContext(), ConfigDecl, false, ConfigQTy, VK_LValue, LLLLoc);
++    SemaRef.MarkFunctionReferenced(LLLLoc, ConfigDecl);
++    return SemaRef.BuildCallExpr(S, ConfigDR, LLLLoc, ExecConfig, GGGLoc,
++                                 nullptr, /*IsExecConfig=*/true);
++  }
++
+   bool IsDeviceKernelCall = false;
+   switch (CurrentTarget()) {
+   case CUDAFunctionTarget::Global:
+diff --git a/clang/lib/Sema/SemaDecl.cpp b/clang/lib/Sema/SemaDecl.cpp
+index 62cb9360d..fb0ae252c 100644
+--- a/clang/lib/Sema/SemaDecl.cpp
++++ b/clang/lib/Sema/SemaDecl.cpp
+@@ -11155,6 +11155,23 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
+     }
+   }
+ 
++  // Ascend CCE: register bisheng's kernel-launch configure function so that the
++  // foo<<<numBlocks, smDesc, stream>>>(...) syntax can be type-checked against
++  // it. This matches the function bisheng's ccec uses (see
++  // __clang_cce_runtime_wrapper.h). Expected signature:
++  //   unsigned int __cce_rtConfigureCall(unsigned int, void*, void*).
++  if (!getLangOpts().CUDA && getLangOpts().CceExt) {
++    if (IdentifierInfo *II = NewFD->getIdentifier()) {
++      if (II->isStr("__cce_rtConfigureCall") && !NewFD->isInvalidDecl() &&
++          NewFD->getDeclContext()->getRedeclContext()->isTranslationUnit()) {
++        if (!R->castAs<FunctionType>()->getReturnType()->isScalarType())
++          Diag(NewFD->getLocation(), diag::err_config_scalar_return)
++              << "__cce_rtConfigureCall";
++        Context.setcudaConfigureCallDecl(NewFD);
++      }
++    }
++  }
++
+   MarkUnusedFileScopedDecl(NewFD);
+ 
+   if (getLangOpts().OpenCL && NewFD->hasAttr<DeviceKernelAttr>()) {
+diff --git a/clang/lib/Sema/SemaDeclAttr.cpp b/clang/lib/Sema/SemaDeclAttr.cpp
+index ae04d3855..b49fac3f3 100644
+--- a/clang/lib/Sema/SemaDeclAttr.cpp
++++ b/clang/lib/Sema/SemaDeclAttr.cpp
+@@ -6323,6 +6323,15 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+   unsigned BuiltinID = Ident->getBuiltinID();
+   StringRef AliasName = cast<FunctionDecl>(D)->getIdentifier()->getName();
+ 
++  // Ascend CCE: allow clang_builtin_alias for __builtin_cce_* builtins.
++  // These are not known to standard clang (BuiltinID == 0) but should be
++  // accepted silently for IDE support of Ascend CCE headers.
++  StringRef BuiltinName = Ident->getName();
++  if (BuiltinName.starts_with("__builtin_cce_")) {
++    D->addAttr(::new (S.Context) BuiltinAliasAttr(S.Context, AL, Ident));
++    return;
++  }
++
+   bool IsAArch64 = S.Context.getTargetInfo().getTriple().isAArch64();
+   bool IsARM = S.Context.getTargetInfo().getTriple().isARM();
+   bool IsRISCV = S.Context.getTargetInfo().getTriple().isRISCV();
+diff --git a/clang/lib/Sema/SemaTemplateVariadic.cpp b/clang/lib/Sema/SemaTemplateVariadic.cpp
+index 5b1aad3fa..eac9006a1 100644
+--- a/clang/lib/Sema/SemaTemplateVariadic.cpp
++++ b/clang/lib/Sema/SemaTemplateVariadic.cpp
+@@ -1188,6 +1188,14 @@ bool Sema::containsUnexpandedParameterPacks(Declarator &D) {
+   case TST_auto_type:
+   case TST_decltype_auto:
+   case TST_BFloat16:
++  case TST_CceHif8:
++  case TST_CceHif4x2:
++  case TST_CceFp8E4M3:
++  case TST_CceFp8E5M2:
++  case TST_CceFp8E6M2:
++  case TST_CceFp8E8M0:
++  case TST_CceFp4E2M1x2:
++  case TST_CceFp4E1M2x2:
+ #define GENERIC_IMAGE_TYPE(ImgType, Id) case TST_##ImgType##_t:
+ #include "clang/Basic/OpenCLImageTypes.def"
+ #define HLSL_INTANGIBLE_TYPE(Name, Id, SingletonId) case TST_##Name:
+diff --git a/clang/lib/Sema/SemaType.cpp b/clang/lib/Sema/SemaType.cpp
+index 44ac4f663..3a53c905b 100644
+--- a/clang/lib/Sema/SemaType.cpp
++++ b/clang/lib/Sema/SemaType.cpp
+@@ -1172,6 +1172,14 @@ static QualType ConvertDeclSpecToType(TypeProcessingState &state) {
+       S.Diag(DS.getTypeSpecTypeLoc(), diag::err_type_unsupported) << "__bf16";
+     Result = Context.BFloat16Ty;
+     break;
++  case DeclSpec::TST_CceHif8: Result = Context.CceHif8Ty; break;
++  case DeclSpec::TST_CceHif4x2: Result = Context.CceHif4x2Ty; break;
++  case DeclSpec::TST_CceFp8E4M3: Result = Context.CceFp8E4M3Ty; break;
++  case DeclSpec::TST_CceFp8E5M2: Result = Context.CceFp8E5M2Ty; break;
++  case DeclSpec::TST_CceFp8E6M2: Result = Context.CceFp8E6M2Ty; break;
++  case DeclSpec::TST_CceFp8E8M0: Result = Context.CceFp8E8M0Ty; break;
++  case DeclSpec::TST_CceFp4E2M1x2: Result = Context.CceFp4E2M1x2Ty; break;
++  case DeclSpec::TST_CceFp4E1M2x2: Result = Context.CceFp4E1M2x2Ty; break;
+   case DeclSpec::TST_float:   Result = Context.FloatTy; break;
+   case DeclSpec::TST_double:
+     if (DS.getTypeSpecWidth() == TypeSpecifierWidth::Long)
+diff --git a/clang/lib/Serialization/ASTCommon.cpp b/clang/lib/Serialization/ASTCommon.cpp
+index 49e6fe800..b031e19f2 100644
+--- a/clang/lib/Serialization/ASTCommon.cpp
++++ b/clang/lib/Serialization/ASTCommon.cpp
+@@ -286,7 +286,31 @@ serialization::TypeIdxFromBuiltin(const BuiltinType *BT) {
+   case BuiltinType::BFloat16:
+     ID = PREDEF_TYPE_BFLOAT16_ID;
+     break;
+-  }
++  case BuiltinType::CceHif8:
++    ID = PREDEF_TYPE_CCE_HIF8_ID;
++    break;
++  case BuiltinType::CceHif4x2:
++    ID = PREDEF_TYPE_CCE_HIF4X2_ID;
++    break;
++  case BuiltinType::CceFp8E4M3:
++    ID = PREDEF_TYPE_CCE_FP8E4M3_ID;
++    break;
++  case BuiltinType::CceFp8E5M2:
++    ID = PREDEF_TYPE_CCE_FP8E5M2_ID;
++    break;
++  case BuiltinType::CceFp8E6M2:
++    ID = PREDEF_TYPE_CCE_FP8E6M2_ID;
++    break;
++  case BuiltinType::CceFp8E8M0:
++    ID = PREDEF_TYPE_CCE_FP8E8M0_ID;
++    break;
++  case BuiltinType::CceFp4E2M1x2:
++    ID = PREDEF_TYPE_CCE_FP4E2M1X2_ID;
++    break;
++  case BuiltinType::CceFp4E1M2x2:
++    ID = PREDEF_TYPE_CCE_FP4E1M2X2_ID;
++    break;
++}
+ 
+   return TypeIdx(0, ID);
+ }
+diff --git a/clang/lib/Serialization/ASTReader.cpp b/clang/lib/Serialization/ASTReader.cpp
+index 74a7b5136..9fd1d298d 100644
+--- a/clang/lib/Serialization/ASTReader.cpp
++++ b/clang/lib/Serialization/ASTReader.cpp
+@@ -7935,6 +7935,30 @@ QualType ASTReader::GetType(TypeID ID) {
+     case PREDEF_TYPE_BFLOAT16_ID:
+       T = Context.BFloat16Ty;
+       break;
++    case PREDEF_TYPE_CCE_HIF8_ID:
++      T = Context.CceHif8Ty;
++      break;
++    case PREDEF_TYPE_CCE_HIF4X2_ID:
++      T = Context.CceHif4x2Ty;
++      break;
++    case PREDEF_TYPE_CCE_FP8E4M3_ID:
++      T = Context.CceFp8E4M3Ty;
++      break;
++    case PREDEF_TYPE_CCE_FP8E5M2_ID:
++      T = Context.CceFp8E5M2Ty;
++      break;
++    case PREDEF_TYPE_CCE_FP8E6M2_ID:
++      T = Context.CceFp8E6M2Ty;
++      break;
++    case PREDEF_TYPE_CCE_FP8E8M0_ID:
++      T = Context.CceFp8E8M0Ty;
++      break;
++    case PREDEF_TYPE_CCE_FP4E2M1X2_ID:
++      T = Context.CceFp4E2M1x2Ty;
++      break;
++    case PREDEF_TYPE_CCE_FP4E1M2X2_ID:
++      T = Context.CceFp4E1M2x2Ty;
++      break;
+     case PREDEF_TYPE_HALF_ID:
+       T = Context.HalfTy;
+       break;
+diff --git a/clang/lib/UnifiedSymbolResolution/USRGeneration.cpp b/clang/lib/UnifiedSymbolResolution/USRGeneration.cpp
+--- a/clang/lib/UnifiedSymbolResolution/USRGeneration.cpp
++++ b/clang/lib/UnifiedSymbolResolution/USRGeneration.cpp
+@@ -759,6 +759,16 @@
+       case BuiltinType::Half:
+         Out << 'h';
+         break;
++      case BuiltinType::CceHif8:
++      case BuiltinType::CceHif4x2:
++      case BuiltinType::CceFp8E4M3:
++      case BuiltinType::CceFp8E5M2:
++      case BuiltinType::CceFp8E6M2:
++      case BuiltinType::CceFp8E8M0:
++      case BuiltinType::CceFp4E2M1x2:
++      case BuiltinType::CceFp4E1M2x2:
++        Out << "@BT@" << BT->getName(Ctx.getPrintingPolicy());
++        break;
+       case BuiltinType::Float:
+         Out << 'f';
+         break;
+diff --git a/clang/lib/Parse/ParseExpr.cpp b/clang/lib/Parse/ParseExpr.cpp
+--- a/clang/lib/Parse/ParseExpr.cpp
++++ b/clang/lib/Parse/ParseExpr.cpp
+@@ -1336,6 +1336,14 @@
+   case tok::kw_float:
+   case tok::kw_double:
+   case tok::kw___bf16:
++  case tok::kw___hif8:
++  case tok::kw___hif4x2:
++  case tok::kw___fp8e4m3:
++  case tok::kw___fp8e5m2:
++  case tok::kw___fp8e6m2:
++  case tok::kw___fp8e8m0:
++  case tok::kw___fp4e2m1x2:
++  case tok::kw___fp4e1m2x2:
+   case tok::kw__Float16:
+   case tok::kw___float128:
+   case tok::kw___ibm128:
+diff --git a/clang/lib/Parse/ParseExprCXX.cpp b/clang/lib/Parse/ParseExprCXX.cpp
+--- a/clang/lib/Parse/ParseExprCXX.cpp
++++ b/clang/lib/Parse/ParseExprCXX.cpp
+@@ -2107,6 +2107,30 @@
+     break;
+   case tok::kw___bf16:
+     DS.SetTypeSpecType(DeclSpec::TST_BFloat16, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___hif8:
++    DS.SetTypeSpecType(DeclSpec::TST_CceHif8, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___hif4x2:
++    DS.SetTypeSpecType(DeclSpec::TST_CceHif4x2, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___fp8e4m3:
++    DS.SetTypeSpecType(DeclSpec::TST_CceFp8E4M3, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___fp8e5m2:
++    DS.SetTypeSpecType(DeclSpec::TST_CceFp8E5M2, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___fp8e6m2:
++    DS.SetTypeSpecType(DeclSpec::TST_CceFp8E6M2, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___fp8e8m0:
++    DS.SetTypeSpecType(DeclSpec::TST_CceFp8E8M0, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___fp4e2m1x2:
++    DS.SetTypeSpecType(DeclSpec::TST_CceFp4E2M1x2, Loc, PrevSpec, DiagID, Policy);
++    break;
++  case tok::kw___fp4e1m2x2:
++    DS.SetTypeSpecType(DeclSpec::TST_CceFp4E1M2x2, Loc, PrevSpec, DiagID, Policy);
+     break;
+   case tok::kw_half:
+     DS.SetTypeSpecType(DeclSpec::TST_half, Loc, PrevSpec, DiagID, Policy);
+diff --git a/clang/lib/Parse/ParseTentative.cpp b/clang/lib/Parse/ParseTentative.cpp
+--- a/clang/lib/Parse/ParseTentative.cpp
++++ b/clang/lib/Parse/ParseTentative.cpp
+@@ -1494,6 +1494,14 @@
+   case tok::kw_float:
+   case tok::kw_double:
+   case tok::kw___bf16:
++  case tok::kw___hif8:
++  case tok::kw___hif4x2:
++  case tok::kw___fp8e4m3:
++  case tok::kw___fp8e5m2:
++  case tok::kw___fp8e6m2:
++  case tok::kw___fp8e8m0:
++  case tok::kw___fp4e2m1x2:
++  case tok::kw___fp4e1m2x2:
+   case tok::kw__Float16:
+   case tok::kw___float128:
+   case tok::kw___ibm128:
+@@ -1622,6 +1630,14 @@
+   case tok::kw_float:
+   case tok::kw_double:
+   case tok::kw___bf16:
++  case tok::kw___hif8:
++  case tok::kw___hif4x2:
++  case tok::kw___fp8e4m3:
++  case tok::kw___fp8e5m2:
++  case tok::kw___fp8e6m2:
++  case tok::kw___fp8e8m0:
++  case tok::kw___fp4e2m1x2:
++  case tok::kw___fp4e1m2x2:
+   case tok::kw__Float16:
+   case tok::kw___float128:
+   case tok::kw___ibm128:
+-- 
+2.43.0

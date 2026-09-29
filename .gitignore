@@ -1,0 +1,7 @@
+build/
+llvm-project/
+.cache/
+.clangd
+.vscode/
+dist/
+__pycache__/
