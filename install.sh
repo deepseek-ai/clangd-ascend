@@ -22,6 +22,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --cann-path)
+            [[ $# -ge 2 && -n "${2:-}" ]] || { echo "ERROR: --cann-path requires a path" >&2; echo "Usage: install.sh --package <archive> [--user] [--cann-path <path>]" >&2; exit 1; }
             CANN_PATH="$2"
             shift 2
             ;;
